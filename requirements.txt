@@ -9,6 +9,7 @@ fire
 fuzzywuzzy
 openai
 litellm>=1.73  # to support `from litellm import get_valid_models`
+tinker # to support Tinker model
 azure.identity
 pyarrow
 rich

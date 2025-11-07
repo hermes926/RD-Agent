@@ -678,18 +678,20 @@ class QlibCondaEnv(LocalEnv[QlibCondaConf]):
                     f"conda create -y -n {self.conf.conda_env_name} python=3.10",
                     shell=True,
                 )
-                subprocess.check_call(
-                    f"conda run -n {self.conf.conda_env_name} pip install --upgrade pip cython",
-                    shell=True,
+                install_cmd = (
+                    f"conda run -n {self.conf.conda_env_name} "
+                    "conda install -y -c conda-forge "
+                    "cython catboost xgboost scipy=1.11.4 tables "
+                    "pytorch nomkl"  # <-- The fix!
                 )
-                subprocess.check_call(
-                    f"conda run -n {self.conf.conda_env_name} pip install git+https://github.com/microsoft/qlib.git@3e72593b8c985f01979bebcf646658002ac43b00",
-                    shell=True,
+                print(f"Running: {install_cmd}")
+                subprocess.check_call(install_cmd, shell=True)
+                pip_cmd = (
+                    f"conda run -n {self.conf.conda_env_name} "
+                    "pip install git+https://github.com/microsoft/qlib.git@3e72593b8c985f01979bebcf646658002ac43b00"
                 )
-                subprocess.check_call(
-                    f"conda run -n {self.conf.conda_env_name} pip install catboost xgboost scipy==1.11.4 tables torch",
-                    shell=True,
-                )
+                print(f"Running: {pip_cmd}")
+                subprocess.check_call(pip_cmd, shell=True)
         except Exception as e:
             print(f"[red]Failed to prepare conda env: {e}[/red]")
 
