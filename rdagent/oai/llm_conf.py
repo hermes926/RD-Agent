@@ -72,7 +72,7 @@ class LLMSettings(ExtendedBaseSettings):
     chat_frequency_penalty: float = 0.0
     chat_presence_penalty: float = 0.0
     chat_token_limit: int = (
-        100000  # 100000 is the maximum limit of gpt4, which might increase in the future version of gpt
+        1000000  # 100000 is the maximum limit of gpt4, which might increase in the future version of gpt
     )
     default_system_prompt: str = "You are an AI assistant who helps to answer user's questions."
     system_prompt_role: str = "system"

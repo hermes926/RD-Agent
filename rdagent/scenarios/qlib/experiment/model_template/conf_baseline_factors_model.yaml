@@ -4,10 +4,10 @@ qlib_init:
 market: &market csi300
 benchmark: &benchmark SH000300
 data_handler_config: &data_handler_config
-    start_time: 2008-01-01
-    end_time: 2020-08-01
-    fit_start_time: 2008-01-01
-    fit_end_time: 2014-12-31
+    start_time: 2010-01-01
+    end_time: 2012-12-31
+    fit_start_time: 2010-01-01
+    fit_end_time: 2010-12-31
     instruments: *market
     infer_processors:
         - class: FilterCol
@@ -29,7 +29,7 @@ data_handler_config: &data_handler_config
         - class: CSRankNorm
           kwargs:
               fields_group: label
-    label: ["Ref($close, -2) / Ref($close, -1) - 1"] 
+    label: ["Ref($close, -4) / Ref($close, -1) - 1"] 
 
 port_analysis_config: &port_analysis_config
     strategy:
@@ -40,8 +40,8 @@ port_analysis_config: &port_analysis_config
             topk: 50
             n_drop: 5
     backtest:
-        start_time: 2017-01-01
-        end_time: 2020-08-01
+        start_time: 2012-01-01
+        end_time: 2012-12-31
         account: 100000000
         benchmark: *benchmark
         exchange_kwargs:
@@ -62,7 +62,7 @@ task:
             weight_decay: {{ weight_decay }}
             metric: loss
             loss: mse
-            n_jobs: 8
+            n_jobs: 0
             GPU: 0
             pt_model_uri: "model.model_cls"
             pt_model_kwargs: {
@@ -78,9 +78,9 @@ task:
                 module_path: qlib.contrib.data.handler
                 kwargs: *data_handler_config
             segments:
-                train: [2008-01-01, 2014-12-31]
-                valid: [2015-01-01, 2016-12-31]
-                test: [2017-01-01, 2020-08-01]
+                train: [2010-01-01, 2010-12-31]
+                valid: [2011-01-01, 2011-12-31]
+                test: [2012-01-01, 2012-12-31]
             {% if step_len %}step_len: {{ step_len }}{% endif %}
     record: 
         - class: SignalRecord

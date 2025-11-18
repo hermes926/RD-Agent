@@ -1,4 +1,5 @@
 import copyreg
+import os
 from typing import Any, Literal, Optional, Type, TypedDict, Union, cast
 
 import numpy as np
@@ -19,6 +20,16 @@ from rdagent.log import rdagent_logger as logger
 from rdagent.oai.backend.base import APIBackend
 from rdagent.oai.llm_conf import LLMSettings
 
+# Attempt to import Tinker SDK components
+try:
+    import tinker
+    import re
+    from tinker import types as tinker_types
+    from tinker_cookbook import renderers, tokenizer_utils
+    TINKER_AVAILABLE = True
+except ImportError:
+    TINKER_AVAILABLE = False
+
 
 # NOTE: Patching! Otherwise, the exception will call the constructor and with following error:
 # `BadRequestError.__init__() missing 2 required positional arguments: 'model' and 'llm_provider'`
@@ -37,7 +48,11 @@ class LiteLLMSettings(LLMSettings):
         env_prefix = "LITELLM_"
         """Use `LITELLM_` as prefix for environment variables"""
 
-    # Placeholder for LiteLLM specific settings, so far it's empty
+    # Tinker specific settings
+    use_tinker: bool = False
+    tinker_base_model: str = "Qwen/Qwen3-30B-A3B"  # Example default
+    tinker_renderer_name: str = "qwen3" # Must match the model family (e.g. 'qwen3', 'llama3')
+    tinker_api_key: Optional[str] = None
 
 
 LITELLM_SETTINGS = LiteLLMSettings()
@@ -45,7 +60,9 @@ ACC_COST = 0.0
 
 
 class LiteLLMAPIBackend(APIBackend):
-    """LiteLLM implementation of APIBackend interface"""
+    """
+    Implementation of APIBackend interface that supports both LiteLLM and Tinker.
+    """
 
     _has_logged_settings: bool = False
 
@@ -54,12 +71,57 @@ class LiteLLMAPIBackend(APIBackend):
             logger.info(f"{LITELLM_SETTINGS}")
             logger.log_object(LITELLM_SETTINGS.model_dump(), tag="LITELLM_SETTINGS")
             self.__class__._has_logged_settings = True
+        
+        self.tinker_client_initialized = False
+        if LITELLM_SETTINGS.use_tinker:
+            if not TINKER_AVAILABLE:
+                logger.error("Tinker is enabled in settings but 'tinker' or 'tinker_cookbook' python packages are not installed.")
+            else:
+                self._init_tinker_client()
+
         super().__init__(*args, **kwargs)
+
+    def _init_tinker_client(self):
+        """Initialize Tinker ServiceClient, SamplingClient, Tokenizer, and Renderer."""
+        try:
+            api_key = LITELLM_SETTINGS.tinker_api_key or os.environ.get("TINKER_API_KEY")
+            if not api_key:
+                logger.warning("Tinker API key not found. Please set LITELLM_TINKER_API_KEY or TINKER_API_KEY env var.")
+            
+            # Set the env var for Tinker SDK if explicitly provided in settings
+            if api_key:
+                os.environ["TINKER_API_KEY"] = api_key
+
+            self.service_client = tinker.ServiceClient()
+            self.sampling_client = self.service_client.create_sampling_client(
+                base_model=LITELLM_SETTINGS.tinker_base_model
+            )
+            
+            logger.info(f"{LogColors.GREEN}Initializing Tinker Tokenizer & Renderer...{LogColors.END}")
+            self.tokenizer = tokenizer_utils.get_tokenizer(LITELLM_SETTINGS.tinker_base_model)
+            self.renderer = renderers.get_renderer(LITELLM_SETTINGS.tinker_renderer_name, self.tokenizer)
+            self.tinker_client_initialized = True
+            logger.info(f"{LogColors.GREEN}Tinker Client Initialized{LogColors.END} for model {LITELLM_SETTINGS.tinker_base_model}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Tinker client: {e}")
+            self.tinker_client_initialized = False
 
     def _calculate_token_from_messages(self, messages: list[dict[str, Any]]) -> int:
         """
-        Calculate the token count from messages
+        Calculate the token count from messages.
+        Uses Tinker's renderer/tokenizer if Tinker is enabled, otherwise LiteLLM.
         """
+        if LITELLM_SETTINGS.use_tinker and self.tinker_client_initialized:
+            try:
+                # Convert messages to Tinker's ModelInput (prompt) and count tokens
+                prompt = self.renderer.build_generation_prompt(messages)
+                # prompt.to_ints() returns the list of token IDs
+                num_tokens = len(prompt.to_ints())
+                logger.info(f"{LogColors.CYAN}Tinker Token count:{LogColors.END} {num_tokens}", tag="debug_tinker_token")
+                return num_tokens
+            except Exception as e:
+                logger.warning(f"Tinker token counting failed, falling back to default: {e}")
+
         num_tokens = token_counter(
             model=LITELLM_SETTINGS.chat_model,
             messages=messages,
@@ -69,8 +131,13 @@ class LiteLLMAPIBackend(APIBackend):
 
     def _create_embedding_inner_function(self, input_content_list: list[str]) -> list[list[float]]:
         """
-        Call the embedding function
+        Call the embedding function.
+        Note: Tinker currently focuses on Training/Sampling. If Tinker adds an embedding endpoint,
+        implementation can be added here. Defaults to LiteLLM for now.
         """
+        if LITELLM_SETTINGS.use_tinker:
+             logger.warning("Tinker does not explicitly support Embeddings API yet. Falling back to LiteLLM/OpenAI for embeddings.")
+
         model_name = LITELLM_SETTINGS.embedding_model
         logger.info(f"{LogColors.GREEN}Using emb model{LogColors.END} {model_name}", tag="debug_litellm_emb")
         if LITELLM_SETTINGS.log_llm_chat_content:
@@ -123,6 +190,91 @@ class LiteLLMAPIBackend(APIBackend):
             reasoning_effort=reasoning_effort,
         )
 
+    def _tinker_sample(
+        self,
+        messages: list[dict[str, Any]],
+        **kwargs
+    ) -> tuple[str, str | None]:
+        """
+        Internal method to handle Tinker sampling (inference).
+        Includes logic to strip <think>...</think> tags from reasoning models.
+        """
+        try:
+            # 1. Render prompt
+            prompt = self.renderer.build_generation_prompt(messages)
+            
+            # 2. Prepare Sampling Params
+            default_stops = self.renderer.get_stop_sequences()
+            stop_sequences = kwargs.get("stop") or default_stops
+            
+            max_tokens = kwargs.get("max_tokens", LITELLM_SETTINGS.chat_max_tokens or 1024)
+            temperature = kwargs.get("temperature", LITELLM_SETTINGS.chat_temperature)
+            
+            sampling_params = tinker_types.SamplingParams(
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stop=stop_sequences
+            )
+
+            # 3. Call Sample
+            if LITELLM_SETTINGS.log_llm_chat_content:
+                logger.info(f"{LogColors.GREEN}Using Tinker model{LogColors.END} {LITELLM_SETTINGS.tinker_base_model}", tag="tinker_sample")
+
+            future = self.sampling_client.sample(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                num_samples=1
+            )
+            
+            # 4. Wait for result
+            result = future.result()
+            
+            # 5. Parse output
+            output_tokens = result.sequences[0].tokens
+            message_data, parse_success = self.renderer.parse_response(output_tokens)
+            
+            if isinstance(message_data, dict) or hasattr(message_data, "__getitem__"):
+                content = message_data["content"]
+            else:
+                content = getattr(message_data, "content", str(message_data))
+
+            # --- FIX: STRIP THINKING TAGS ---
+            if "<think>" in content and "</think>" in content:
+                # Log the thinking process for debugging purposes before stripping it
+                thinking_content = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
+                if thinking_content and LITELLM_SETTINGS.log_llm_chat_content:
+                    logger.info(f"{LogColors.YELLOW}Thinking Process:{LogColors.END}\n{thinking_content.group(1)}", tag="reasoning")
+
+                # Remove the block
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+            if "</think>" in content:
+                # Log the discarded thinking process for debugging
+                # We take everything *before* the tag as the thought
+                raw_thought = content.split("</think>")[0]
+                
+                # Clean up potential opening tag for the log
+                clean_log_thought = raw_thought.replace("<think>", "").strip()
+                
+                if LITELLM_SETTINGS.log_llm_chat_content:
+                     logger.info(f"{LogColors.YELLOW}Thinking Process:{LogColors.END}\n{clean_log_thought}", tag="reasoning")
+
+                # The actual content is everything *after* the closing tag
+                content = content.split("</think>")[-1].strip()
+
+            finish_reason = "stop" 
+            
+            if LITELLM_SETTINGS.log_llm_chat_content:
+                logger.info(
+                    f"{LogColors.BLUE}assistant (Tinker - Cleaned):{LogColors.END}\n{content}", tag="llm_messages"
+                )
+            
+            return content, finish_reason
+
+        except Exception as e:
+            logger.error(f"Error during Tinker sampling: {e}")
+            raise e
+
     def _create_chat_completion_inner_function(  # type: ignore[no-untyped-def] # noqa: C901, PLR0912, PLR0915
         self,
         messages: list[dict[str, Any]],
@@ -131,8 +283,17 @@ class LiteLLMAPIBackend(APIBackend):
         **kwargs,
     ) -> tuple[str, str | None]:
         """
-        Call the chat completion function
+        Call the chat completion function.
+        Dispatches to Tinker if `LITELLM_SETTINGS.use_tinker` is True.
         """
+        
+        # --- Tinker Branch ---
+        if LITELLM_SETTINGS.use_tinker and self.tinker_client_initialized:
+             complete_kwargs = self.get_complete_kwargs()
+             # Merge kwargs
+             tinker_kwargs = {**complete_kwargs, **kwargs}
+             return self._tinker_sample(messages, **tinker_kwargs)
+        # ---------------------
 
         if response_format and not supports_response_schema(model=LITELLM_SETTINGS.chat_model):
             # Deepseek will enter this branch
@@ -222,6 +383,11 @@ class LiteLLMAPIBackend(APIBackend):
         """
         Check if the backend supports function calling
         """
+        # Tinker generally supports structured output via strict renderers/grammars, 
+        # but for basic compatibility we check settings or base model.
+        if LITELLM_SETTINGS.use_tinker:
+             return False # Assume False for basic Tinker integration unless specific renderer supports it
+             
         return supports_response_schema(model=LITELLM_SETTINGS.chat_model) and LITELLM_SETTINGS.enable_response_schema
 
     @property
